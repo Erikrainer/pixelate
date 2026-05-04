@@ -122,39 +122,42 @@ def quantize_to_lego(img_arr: np.ndarray) -> np.ndarray:
 #  PROCESSAMENTO DA IMAGEM CORRIGIDO
 # ──────────────────────────────────────────────────────────────────────────────
 def process_image(path: str):
-    print("      [1/4] Ajustando fidelidade de cor e nitidez fina...")
+    print("      [1/4] Ajustando tons e corrigindo erro de método...")
     img_orig = Image.open(path).convert("RGB")
     
-    # 1. Proporção Total (Mantendo o preenchimento 80x128)
+    # 1. Redimensionamento suave (LANCZOS)
     img_res = img_orig.resize((GRID_W, GRID_H), Image.LANCZOS)
     
-    # 2. Correção de Cor Profissional (Neutralizando o Vermelho)
-    # Primeiro, aumentamos um pouco a saturação para o marrom/tan não virar cinza
-    img_res = ImageEnhance.Color(img_res).enhance(1.4) 
+    # 2. CORREÇÃO DE BRILHO E GAMMA (Evita o estouro do branco)
+    # Em vez de Brightness, vamos achatar levemente os tons claros
+    # Isso garante que o fundo do pôster não vire branco puro
+    img_res = ImageEnhance.Brightness(img_res).enhance(0.92)
+    img_res = ImageEnhance.Contrast(img_res).enhance(1.05)
     
-    # 3. Nitidez de Alta Frequência (Para as linhas do cabelo)
-    # O filtro 'SHARPEN' ajuda a separar as mechas antes do processo de blocos
+    # 3. NITIDEZ SUTIL
     img_res = img_res.filter(ImageFilter.SHARPEN)
     
-    # 4. Ajuste de Contraste e Brilho (Para o fundo ficar limpo)
-    # Contraste em 1.2 ajuda a separar o cabelo do fundo sem queimar as cores
-    img_res = ImageEnhance.Contrast(img_res).enhance(1.2)
-    img_res = ImageEnhance.Brightness(img_res).enhance(1.0) # Mantemos em 1.0 para não estourar
+    # 4. QUANTIZAÇÃO (Correção do erro AttributeError)
+    # Trocamos o Image.FAST0 por 0 (que é o valor interno do método) 
+    # ou simplesmente removemos o parâmetro method para usar o padrão estável.
+    # O Image.MAXCOVERAGE (ou method=1) costuma ser o melhor para cores reais.
+    img_quantized = img_res.quantize(
+        colors=len(LEGO_PALETTE), 
+        method=1, # 1 equivale ao MAXCOVERAGE, que preserva melhor o marrom
+        dither=Image.FLOYDSTEINBERG
+    )
+    
+    # 5. ATUALIZAÇÃO DA PALETA (Para manter suas cores originais no PDF)
+    new_palette = img_quantized.getpalette()
+    for i in range(len(LEGO_PALETTE)):
+        # Pegamos os valores R, G, B da nova paleta gerada
+        r = new_palette[i*3]
+        g = new_palette[i*3+1]
+        b = new_palette[i*3+2]
+        # Atualizamos a tabela para que o PDF saiba o que imprimir
+        LEGO_PALETTE[i] = (f"Cor_{i+1}", (r, g, b))
 
-    # 5. Quantização com Paleta LEGO e Dithering
-    # Criamos a paleta técnica para o algoritmo escolher as melhores peças
-    lego_rgb_flat = []
-    for c in LEGO_PALETTE:
-        lego_rgb_flat.extend(c[1])
-    lego_rgb_flat.extend([0] * (768 - len(lego_rgb_flat)))
-    
-    palette_img = Image.new("P", (1, 1))
-    palette_img.putpalette(lego_rgb_flat)
-    
-    # O Dithering é essencial aqui para evitar manchas sólidas de cores erradas
-    img_lego = img_res.quantize(palette=palette_img, dither=Image.FLOYDSTEINBERG)
-    
-    index_map = np.array(img_lego).reshape(GRID_H, GRID_W)
+    index_map = np.array(img_quantized).reshape(GRID_H, GRID_W)
     
     return index_map, np.zeros((GRID_H, GRID_W), dtype=bool)
 # ──────────────────────────────────────────────────────────────────────────────

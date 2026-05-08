@@ -122,15 +122,5 @@ cd pixelate
 # Install dependencies
 pip install -r requirements.txt
 
-# How to Run #1
- python lego_mosaic.py input_image.jpg
-
-# Output #1
-lego_guide.pdf
-
-# How to Run #2
-Open folder dist 
-double click run.exe
-
-# Output #2
-lego_guide.pdf
+# How to Run
+ python -m streamlit run lego_mosaic.py

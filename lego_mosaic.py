@@ -1,256 +1,216 @@
-"""
-=============================================================================
-  LEGO Mosaic Building Instruction Generator (VERSÃO DEFINITIVA E LIMPA)
-=============================================================================
-  Converts any image into a printable LEGO-style step-by-step PDF guide.
-=============================================================================
-"""
-
-import sys
-import os
-import argparse
-import textwrap
-import io
-
+import streamlit as st
+from PIL import Image, ImageEnhance, ImageDraw
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont, ImageEnhance, ImageOps, ImageFilter
+import io
+from fpdf import FPDF
+import tempfile
+import os
+import time
 
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.pdfgen import canvas
-from reportlab.lib.utils import ImageReader
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(page_title="Gerador de Mosaico Pro", layout="wide")
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  LEGO COLOUR PALETTE
-# ──────────────────────────────────────────────────────────────────────────────
-LEGO_PALETTE = [
-    ("White",           (255, 255, 255)),
-    ("Light Bluish Gray",(171, 173, 172)),
-    ("Dark Bluish Gray", ( 89,  93,  96)),
-    ("Black",           (  0,   0,   0)),
-    ("Bright Red",      (196,  40,  28)),
-    ("Dark Red",        (123,  46,  47)),
-    ("Bright Orange",   (254, 138,  24)),
-    ("Bright Yellow",   (255, 205,   0)),
-    ("Bright Green",    ( 75, 151,  74)),
-    ("Dark Green",      ( 35, 120,  65)),
-    ("Bright Blue",     (  0, 114, 188)),
-    ("Dark Blue",       ( 20,  48, 100)),
-    ("Medium Blue",     ( 97, 175, 217)),
-    ("Sky Blue",        (146, 207, 224)),
-    ("Sand Blue",       (105, 138, 167)),
-    ("Bright Purple",   (107,  50, 124)),
-    ("Medium Lavender", (160, 110, 185)),
-    ("Bright Pink",     (255, 102, 147)),
-    ("Light Pink",      (252, 204, 210)),
-    ("Tan",             (222, 198, 156)),
-    ("Dark Tan",        (150, 130,  96)),
-    ("Brown",           (105,  64,  40)),
-    ("Reddish Brown",   (128,  70,  50)),
-    ("Olive Green",     ( 95, 116,  35)),
-    ("Lime Green",      (167, 202,  26)),
-    ("Light Nougat",    (255, 201, 149)),
-    ("Nougat",          (204, 142, 105)),
-    ("Reddish Orange",  (220,  60,  30)),
-]
+# Constantes do Projeto (Luffy: 5x8 placas de 16x16 = 80x128 studs)
+COLUNAS_PLACAS = 5
+LINHAS_PLACAS = 8
+TAMANHO_PLACA = 16
+GRID_W = COLUNAS_PLACAS * TAMANHO_PLACA  # 80
+GRID_H = LINHAS_PLACAS * TAMANHO_PLACA   # 128
 
-GRID_W  = 80
-GRID_H  = 128
-PLATE_W = 16
-PLATE_H = 16
-COLS    = 5
-ROWS    = 8
+# --- INICIALIZAÇÃO DO ESTADO (Para não perder dados ao interagir) ---
+if 'matriz' not in st.session_state:
+    st.session_state.matriz = None
+if 'paleta' not in st.session_state:
+    st.session_state.paleta = None
 
-# ──────────────────────────────────────────────────────────────────────────────
-#  MATEMÁTICA DE COR
-# ──────────────────────────────────────────────────────────────────────────────
-def _rgb_to_linear(channel: float) -> float:
-    c = channel / 255.0
-    return c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4
+def reiniciar_projeto():
+    st.session_state.matriz = None
+    st.session_state.paleta = None
 
-def _linear_to_xyz(r: float, g: float, b: float):
-    m = np.array([
-        [0.4124564, 0.3575761, 0.1804375],
-        [0.2126729, 0.7151522, 0.0721750],
-        [0.0193339, 0.1191920, 0.9503041],
-    ])
-    return m @ np.array([r, g, b])
+st.title("🧱 Mosaico Studio v5.0 - Edição & Manual Profissional")
 
-def _xyz_to_lab(xyz):
-    ref = np.array([0.95047, 1.00000, 1.08883])
-    t = xyz / ref
-    def f(v):
-        return v ** (1 / 3) if v > 0.008856 else 7.787 * v + 16 / 116
-    fx, fy, fz = f(t[0]), f(t[1]), f(t[2])
-    L = 116 * fy - 16
-    a = 500 * (fx - fy)
-    b = 200 * (fy - fz)
-    return np.array([L, a, b])
+# --- BARRA LATERAL: CONTROLES DE PROCESSAMENTO ---
+st.sidebar.header("1. Entrada de Imagem")
+uploaded_file = st.sidebar.file_uploader("Selecione a imagem original", type=["jpg", "png", "jpeg"])
 
-def rgb_to_lab(rgb_tuple):
-    return _xyz_to_lab(_linear_to_xyz(*[_rgb_to_linear(c) for c in rgb_tuple]))
-
-_PALETTE_LAB = np.array([rgb_to_lab(c[1]) for c in LEGO_PALETTE], dtype=np.float32)
-
-def _vectorized_rgb_to_lab(arr: np.ndarray) -> np.ndarray:
-    rgb = arr.astype(np.float32) / 255.0
-    linear = np.where(rgb <= 0.04045, rgb / 12.92, ((rgb + 0.055) / 1.055) ** 2.4)
-    M = np.array([
-        [0.4124564, 0.3575761, 0.1804375],
-        [0.2126729, 0.7151522, 0.0721750],
-        [0.0193339, 0.1191920, 0.9503041],
-    ], dtype=np.float32)
-    xyz = linear @ M.T
-    ref = np.array([0.95047, 1.00000, 1.08883], dtype=np.float32)
-    t = xyz / ref
-    f = np.where(t > 0.008856, np.cbrt(t), 7.787 * t + (16.0 / 116.0))
-    L = 116.0 * f[:, 1] - 16.0
-    a = 500.0 * (f[:, 0] - f[:, 1])
-    b = 200.0 * (f[:, 1] - f[:, 2])
-    return np.stack([L, a, b], axis=1)
-
-def quantize_to_lego(img_arr: np.ndarray) -> np.ndarray:
-    H, W = img_arr.shape[:2]
-    flat = img_arr.reshape(-1, 3)
-    pix_lab = _vectorized_rgb_to_lab(flat)
-    diff = pix_lab[:, np.newaxis, :] - _PALETTE_LAB[np.newaxis, :, :]
-    dist_sq = np.sum(diff ** 2, axis=2)
-    idx_flat = np.argmin(dist_sq, axis=1).astype(np.uint8)
-    return idx_flat.reshape(H, W)
-
-# ──────────────────────────────────────────────────────────────────────────────
-#  PROCESSAMENTO DA IMAGEM CORRIGIDO
-# ──────────────────────────────────────────────────────────────────────────────
-def process_image(path: str):
-    print("      [1/4] Ajustando tons e corrigindo erro de método...")
-    img_orig = Image.open(path).convert("RGB")
+if uploaded_file:
+    st.sidebar.divider()
+    st.sidebar.header("2. Ajustes de Qualidade")
+    num_cores = st.sidebar.slider("Quantidade de Cores (Paleta)", 2, 64, 16)
     
-    # 1. Redimensionamento suave (LANCZOS)
-    img_res = img_orig.resize((GRID_W, GRID_H), Image.LANCZOS)
+    st.sidebar.subheader("Preservação de Detalhes")
+    preservar = st.sidebar.checkbox("🛡️ Proteger Traços (Dedos/Letras)", value=True)
+    contraste = st.sidebar.slider("Força do Traço Escuro", 1.0, 3.0, 1.5)
     
-    # 2. CORREÇÃO DE BRILHO E GAMMA (Evita o estouro do branco)
-    # Em vez de Brightness, vamos achatar levemente os tons claros
-    # Isso garante que o fundo do pôster não vire branco puro
-    img_res = ImageEnhance.Brightness(img_res).enhance(0.92)
-    img_res = ImageEnhance.Contrast(img_res).enhance(1.05)
-    
-    # 3. NITIDEZ SUTIL
-    img_res = img_res.filter(ImageFilter.SHARPEN)
-    
-    # 4. QUANTIZAÇÃO (Correção do erro AttributeError)
-    # Trocamos o Image.FAST0 por 0 (que é o valor interno do método) 
-    # ou simplesmente removemos o parâmetro method para usar o padrão estável.
-    # O Image.MAXCOVERAGE (ou method=1) costuma ser o melhor para cores reais.
-    img_quantized = img_res.quantize(
-        colors=len(LEGO_PALETTE), 
-        method=1, # 1 equivale ao MAXCOVERAGE, que preserva melhor o marrom
-        dither=Image.FLOYDSTEINBERG
-    )
-    
-    # 5. ATUALIZAÇÃO DA PALETA (Para manter suas cores originais no PDF)
-    new_palette = img_quantized.getpalette()
-    for i in range(len(LEGO_PALETTE)):
-        # Pegamos os valores R, G, B da nova paleta gerada
-        r = new_palette[i*3]
-        g = new_palette[i*3+1]
-        b = new_palette[i*3+2]
-        # Atualizamos a tabela para que o PDF saiba o que imprimir
-        LEGO_PALETTE[i] = (f"Cor_{i+1}", (r, g, b))
-
-    index_map = np.array(img_quantized).reshape(GRID_H, GRID_W)
-    
-    return index_map, np.zeros((GRID_H, GRID_W), dtype=bool)
-# ──────────────────────────────────────────────────────────────────────────────
-#  UTILITÁRIOS PDF E RENDER
-# ──────────────────────────────────────────────────────────────────────────────
-def split_into_plates(index_map: np.ndarray):
-    plates = []
-    for row in range(ROWS):
-        for col in range(COLS):
-            y0, y1 = row * PLATE_H, (row + 1) * PLATE_H
-            x0, x1 = col * PLATE_W, (col + 1) * PLATE_W
-            plates.append(index_map[y0:y1, x0:x1].copy())
-    return plates
-
-def render_full_mosaic(index_map: np.ndarray, scale: int = 1) -> Image.Image:
-    palette_arr = np.array([c[1] for c in LEGO_PALETTE], dtype=np.uint8)
-    rgb = palette_arr[index_map]
-    if scale > 1:
-        rgb = np.repeat(np.repeat(rgb, scale, axis=0), scale, axis=1)
-    return Image.fromarray(rgb, "RGB")
-
-def render_plate(plate: np.ndarray, cell_px: int = 30) -> Image.Image:
-    margin = 28
-    grid_size = PLATE_W * cell_px
-    img = Image.new("RGB", (margin + grid_size + 4, margin + grid_size + 4), (225, 228, 232))
-    draw = ImageDraw.Draw(img)
-    try: font_sm = ImageFont.truetype("arial.ttf", 9)
-    except: font_sm = ImageFont.load_default()
-    
-    for row in range(PLATE_H):
-        for col in range(PLATE_W):
-            colour = LEGO_PALETTE[plate[row, col]][1]
-            x0, y0 = margin + col * cell_px, margin + row * cell_px
-            draw.rectangle([x0, y0, x0 + cell_px - 1, y0 + cell_px - 1], fill=colour, outline=(80,80,80))
-            sr, sg, sb = colour
-            stud_c = (min(255, sr+60), min(255, sg+60), min(255, sb+60)) if (0.299*sr + 0.587*sg + 0.114*sb) < 128 else (max(0, sr-50), max(0, sg-50), max(0, sb-50))
-            cx, cy = x0 + cell_px // 2, y0 + cell_px // 2
-            r = max(2, cell_px // 5)
-            draw.ellipse([cx-r, cy-r, cx+r, cy+r], outline=stud_c)
-
-    col_let = "ABCDEFGHIJKLMNOP"
-    for col in range(PLATE_W): draw.text((margin + col*cell_px + cell_px//2, 6), col_let[col], fill=(80,80,80), font=font_sm, anchor="mt")
-    for row in range(PLATE_H): draw.text((8, margin + row*cell_px + cell_px//2), str(row+1), fill=(80,80,80), font=font_sm, anchor="lm")
-    return img
-
-def pil_to_reportlab(pil_img: Image.Image) -> ImageReader:
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG")
-    buf.seek(0)
-    return ImageReader(buf)
-
-# Funções simplificadas de PDF
-def draw_cover(c, orig_path, mosaic_img, project_name):
-    c.setFillColorRGB(0.95, 0.95, 0.95); c.rect(0, 0, A4[0], A4[1], fill=1, stroke=0)
-    c.setFillColorRGB(0.77, 0.16, 0.11); c.rect(0, A4[1] - 45*mm, A4[0], 45*mm, fill=1, stroke=0)
-    c.setFillColorRGB(1, 1, 1); c.setFont("Helvetica-Bold", 28)
-    c.drawCentredString(A4[0]/2, A4[1] - 22*mm, "LEGO MOSAIC - CORRIGIDO")
-    
-    try:
-        orig = ImageReader(orig_path)
-        c.drawImage(orig, 20*mm, A4[1]*0.3, width=200, height=280, preserveAspectRatio=True)
-    except: pass
-    c.drawImage(pil_to_reportlab(mosaic_img.resize((320, 512), Image.NEAREST)), A4[0]/2 + 20*mm, A4[1]*0.3, width=200, height=280, preserveAspectRatio=True)
-    c.showPage()
-
-def generate_lego_guide(image_path: str, output_path: str = "guia_lego_novo.pdf"):
-    if not os.path.isfile(image_path): sys.exit(f"[ERRO] Arquivo não encontrado: {image_path}")
-    project_name = os.path.splitext(os.path.basename(image_path))[0]
-    
-    print("=" * 60)
-    print("  Gerador LEGO (Motor Corrigido e Limpo)")
-    print("=" * 60)
-    
-    index_map, _ = process_image(image_path)
-    plates = split_into_plates(index_map)
-    mosaic_preview = render_full_mosaic(index_map)
-    
-    c = canvas.Canvas(output_path, pagesize=A4)
-    draw_cover(c, image_path, mosaic_preview, project_name)
-    
-    # Gera apenas as 40 placas para simplificar o PDF gerado no teste
-    for i, p in enumerate(plates):
-        c.drawImage(pil_to_reportlab(render_plate(p)), 20*mm, 80*mm, width=450, height=450, preserveAspectRatio=True)
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(20*mm, 270*mm, f"Placa {i+1} de 40")
-        c.showPage()
+    if st.sidebar.button("⚙️ Gerar Mosaico Base"):
+        img = Image.open(uploaded_file).convert("RGB")
         
-    c.save()
-    print(f"\n  ✓  PDF salvo com sucesso em: {output_path}")
+        # --- MOTOR DE ALTA FIDELIDADE (SUPER-SAMPLING) ---
+        if preservar:
+            # Passo 1: Redução suave para o dobro do tamanho
+            temp_img = img.resize((GRID_W * 2, GRID_H * 2), Image.LANCZOS)
+            # Passo 2: Enfatiza os traços pretos (letras/contornos)
+            temp_img = ImageEnhance.Contrast(temp_img).enhance(contraste)
+            # Passo 3: Redução final para 80x128 (Nearest para cor limpa)
+            img_res = temp_img.resize((GRID_W, GRID_H), Image.NEAREST)
+        else:
+            img_res = img.resize((GRID_W, GRID_H), Image.LANCZOS)
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument("image", help="Caminho da imagem")
-    parser.add_argument("-o", "--output", default="guia_lego_novo.pdf")
-    args = parser.parse_args()
-    generate_lego_guide(args.image, args.output)
+        # --- QUANTIZAÇÃO K-MEANS (Melhores cores possíveis) ---
+        img_quant = img_res.quantize(colors=num_cores, method=2, kmeans=num_cores, dither=Image.NONE)
+        
+        # Salva no estado da sessão
+        st.session_state.paleta = [img_quant.getpalette()[i*3:i*3+3] for i in range(num_cores)]
+        st.session_state.matriz = np.array(img_quant)
+        st.rerun()
+
+# --- ÁREA PRINCIPAL ---
+if st.session_state.matriz is not None:
+    # Preparar a imagem para exibição
+    paleta = st.session_state.paleta
+    matriz = st.session_state.matriz
+    
+    p_flat = []
+    for c in paleta: p_flat.extend(c)
+    while len(p_flat) < 768: p_flat.append(0)
+    
+    img_display = Image.new("P", (GRID_W, GRID_H))
+    img_display.putpalette(p_flat)
+    img_display.putdata(matriz.flatten())
+    
+    col_view, col_edit = st.columns([2, 1])
+
+    with col_view:
+        st.subheader("🖼️ Visualização do Mosaico")
+        escala = 8
+        view_rgb = img_display.convert("RGB").resize((GRID_W * escala, GRID_H * escala), Image.NEAREST)
+        
+        # Grade de placas (16x16)
+        draw_v = ImageDraw.Draw(view_rgb)
+        for x in range(0, GRID_W * escala, TAMANHO_PLACA * escala):
+            draw_v.line([(x, 0), (x, GRID_H * escala)], fill=(255, 0, 0, 120), width=1)
+        for y in range(0, GRID_H * escala, TAMANHO_PLACA * escala):
+            draw_v.line([(0, y), (GRID_H * escala, y)], fill=(255, 0, 0, 120), width=1)
+            
+        st.image(view_rgb, use_container_width=True)
+
+    with col_edit:
+        st.subheader("🖌️ Editor Manual")
+        st.write("Corrija pixels específicos:")
+        ex = st.number_input("X (Coluna)", 0, 79, 0)
+        ey = st.number_input("Y (Linha)", 0, 127, 0)
+        
+        cores_opcoes = [f"Cor {i+1} - RGB{paleta[i]}" for i in range(len(paleta))]
+        nova_cor = st.selectbox("Selecione a Cor", range(len(cores_opcoes)), format_func=lambda x: cores_opcoes[x])
+        
+        if st.button("Pintar Pixel"):
+            st.session_state.matriz[ey, ex] = nova_cor
+            st.success(f"Pixel ({ex},{ey}) atualizado!")
+            time.sleep(0.3)
+            st.rerun()
+
+    # --- GERAÇÃO DE PDF (ESTILO BRIKO - LINHA POR LINHA) ---
+    st.divider()
+    st.subheader("📄 Gerar Manual de Instruções")
+    
+    if st.button("🚀 Gerar PDF Passo-a-Passo"):
+        try:
+            with st.spinner("Desenhando manual de 130 páginas..."):
+                pdf = FPDF(orientation="P", unit="mm", format="A4")
+                
+                # --- PÁGINA 1: OVERVIEW ---
+                pdf.add_page()
+                pdf.set_font("Arial", 'B', 24)
+                pdf.cell(0, 20, "Project Overview", ln=True, align="C")
+                
+                # Capa (Imagem do projeto)
+                with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                    view_rgb.save(tf.name)
+                    pdf.image(tf.name, x=35, y=40, w=140)
+                    path_capa = tf.name
+
+                pdf.set_xy(10, 250)
+                pdf.set_font("Arial", '', 14)
+                pdf.cell(0, 10, f"Size: {GRID_W}x{GRID_H} studs | Total: {GRID_W*GRID_H} bricks", ln=True, align="C")
+
+                # --- PÁGINAS DE PASSOS (128 LINHAS) ---
+                cel = 10 # Tamanho do stud na imagem do PDF
+                img_progresso = Image.new("RGB", (GRID_W * cel, GRID_H * cel), (245, 245, 245))
+                draw_p = ImageDraw.Draw(img_progresso)
+
+                for step in range(GRID_H):
+                    pdf.add_page()
+                    pdf.set_font("Arial", 'B', 16)
+                    pdf.cell(0, 10, f"Step {step + 1}", ln=True)
+                    
+                    # Informações da linha
+                    pdf.set_font("Arial", '', 11)
+                    pdf.cell(0, 6, f"Place now: {GRID_W}  |  Total so far: {(step+1)*GRID_W}", ln=True)
+                    
+                    # Legenda de cores desta linha
+                    linha_data = matriz[step, :]
+                    cores_na_linha = np.unique(linha_data)
+                    
+                    pdf.set_font("Arial", 'B', 10)
+                    pdf.cell(0, 8, "Colors needed for this line:", ln=True)
+                    
+                    pdf.set_font("Arial", '', 9)
+                    curr_x = 10
+                    for c_idx in cores_na_linha:
+                        rgb = paleta[c_idx]
+                        qtd = np.count_nonzero(linha_data == c_idx)
+                        
+                        pdf.set_fill_color(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+                        pdf.rect(curr_x, pdf.get_y(), 4, 4, 'F')
+                        pdf.set_xy(curr_x + 5, pdf.get_y())
+                        pdf.cell(35, 4, f"Cor {c_idx+1} ({qtd})")
+                        curr_x += 40
+                        if curr_x > 180:
+                            curr_x = 10
+                            pdf.ln(5)
+                    
+                    # Atualiza a imagem de progresso linha por linha
+                    for col in range(GRID_W):
+                        idx = matriz[step, col]
+                        rgb = tuple(paleta[idx])
+                        draw_p.rectangle([col*cel, step*cel, (col+1)*cel, (step+1)*cel], fill=rgb, outline=(180,180,180))
+
+                    # Insere a imagem do progresso no PDF
+                    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+                        img_progresso.save(tf.name)
+                        pdf.image(tf.name, x=20, y=50, w=170)
+                        path_step = tf.name
+                    os.remove(path_step)
+
+                    # Numeração de página
+                    pdf.set_xy(10, 285)
+                    pdf.set_font("Arial", 'I', 8)
+                    pdf.cell(0, 5, f"p. {step+1} of 128", align="R")
+
+                # --- PÁGINA FINAL: BOM ---
+                pdf.add_page()
+                pdf.set_font("Arial", 'B', 20)
+                pdf.cell(0, 15, "Bill of Materials", ln=True)
+                
+                counts = np.unique(matriz, return_counts=True)
+                for c_idx, count in zip(counts[0], counts[1]):
+                    rgb = paleta[c_idx]
+                    pdf.set_fill_color(int(rgb[0]), int(rgb[1]), int(rgb[2]))
+                    pdf.rect(10, pdf.get_y()+2, 6, 6, 'F')
+                    pdf.set_xy(20, pdf.get_y())
+                    pdf.set_font("Arial", '', 12)
+                    pdf.cell(100, 10, f"Cor {c_idx+1} (RGB: {rgb[0]},{rgb[1]},{rgb[2]})")
+                    pdf.cell(30, 10, f"Total: {count}", align="R")
+                    pdf.ln(8)
+
+                # Limpeza e Download
+                os.remove(path_capa)
+                pdf_output = pdf.output(dest='S').encode('latin-1')
+                st.success("✅ Manual Gerado!")
+                st.download_button("📥 Baixar PDF Briko-Style", pdf_output, "manual_montagem.pdf", "application/pdf")
+
+        except Exception as e:
+            st.error(f"Erro na geração: {e}")
+
+else:
+    st.info("Aguardando imagem...")

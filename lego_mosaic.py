@@ -1,5 +1,5 @@
 import streamlit as st
-from PIL import Image, ImageEnhance, ImageDraw
+from PIL import Image, ImageEnhance, ImageFilter, ImageDraw
 import numpy as np
 import io
 from fpdf import FPDF
@@ -7,210 +7,171 @@ import tempfile
 import os
 import time
 
-# --- CONFIGURAÇÃO DA PÁGINA ---
-st.set_page_config(page_title="Gerador de Mosaico Pro", layout="wide")
+# --- CONFIGURAÇÃO ---
+st.set_page_config(page_title="Mosaico Studio Pro v6.0", layout="wide")
 
-# Constantes do Projeto (Luffy: 5x8 placas de 16x16 = 80x128 studs)
-COLUNAS_PLACAS = 5
-LINHAS_PLACAS = 8
+COLUNAS_PLACAS, LINHAS_PLACAS = 5, 8
 TAMANHO_PLACA = 16
-GRID_W = COLUNAS_PLACAS * TAMANHO_PLACA  # 80
-GRID_H = LINHAS_PLACAS * TAMANHO_PLACA   # 128
+GRID_W, GRID_H = 80, 128
 
-# --- INICIALIZAÇÃO DO ESTADO (Para não perder dados ao interagir) ---
 if 'matriz' not in st.session_state:
     st.session_state.matriz = None
 if 'paleta' not in st.session_state:
     st.session_state.paleta = None
 
-def reiniciar_projeto():
-    st.session_state.matriz = None
-    st.session_state.paleta = None
+st.title("🧱 Mosaico Studio v6.0 - Alta Definição de Linhas")
 
-st.title("🧱 Mosaico Studio v5.0 - Edição & Manual Profissional")
-
-# --- BARRA LATERAL: CONTROLES DE PROCESSAMENTO ---
-st.sidebar.header("1. Entrada de Imagem")
-uploaded_file = st.sidebar.file_uploader("Selecione a imagem original", type=["jpg", "png", "jpeg"])
+# --- SIDEBAR ---
+st.sidebar.header("1. Configurações de Imagem")
+uploaded_file = st.sidebar.file_uploader("Imagem do Luffy", type=["jpg", "png", "jpeg"])
 
 if uploaded_file:
     st.sidebar.divider()
-    st.sidebar.header("2. Ajustes de Qualidade")
-    num_cores = st.sidebar.slider("Quantidade de Cores (Paleta)", 2, 64, 16)
+    st.sidebar.header("2. Motor de Nitidez")
     
-    st.sidebar.subheader("Preservação de Detalhes")
-    preservar = st.sidebar.checkbox("🛡️ Proteger Traços (Dedos/Letras)", value=True)
-    contraste = st.sidebar.slider("Força do Traço Escuro", 1.0, 3.0, 1.5)
+    num_cores = st.sidebar.slider("Cores", 2, 48, 16)
     
-    if st.sidebar.button("⚙️ Gerar Mosaico Base"):
+    # NOVO: Filtro de Mediana para limpar pixels isolados
+    limpeza = st.sidebar.slider("Limpeza de Ruído (Unificar Cores)", 0, 5, 2, 
+                                help="Remove pixels 'perdidos' nas bordas. Valores altos deixam o desenho mais limpo.")
+    
+    # NOVO: Realce de Contorno para letras e detalhes
+    contorno = st.sidebar.slider("Definição de Contorno (Linhas Pretas)", 0.0, 2.0, 1.0, 0.1,
+                                 help="Aumenta as linhas pretas do cabelo e letras.")
+    
+    contraste_extra = st.sidebar.slider("Contraste da Paleta", 1.0, 3.0, 1.3)
+
+    if st.sidebar.button("⚙️ Gerar Mosaico de Alta Definição"):
         img = Image.open(uploaded_file).convert("RGB")
         
-        # --- MOTOR DE ALTA FIDELIDADE (SUPER-SAMPLING) ---
-        if preservar:
-            # Passo 1: Redução suave para o dobro do tamanho
-            temp_img = img.resize((GRID_W * 2, GRID_H * 2), Image.LANCZOS)
-            # Passo 2: Enfatiza os traços pretos (letras/contornos)
-            temp_img = ImageEnhance.Contrast(temp_img).enhance(contraste)
-            # Passo 3: Redução final para 80x128 (Nearest para cor limpa)
-            img_res = temp_img.resize((GRID_W, GRID_H), Image.NEAREST)
-        else:
-            img_res = img.resize((GRID_W, GRID_H), Image.LANCZOS)
-
-        # --- QUANTIZAÇÃO K-MEANS (Melhores cores possíveis) ---
-        img_quant = img_res.quantize(colors=num_cores, method=2, kmeans=num_cores, dither=Image.NONE)
+        # --- PASSO 1: LIMPEZA DE RUÍDO ---
+        if limpeza > 0:
+            # O Filtro de Mediana é perfeito para o que você quer: ele unifica cores próximas
+            for _ in range(limpeza):
+                img = img.filter(ImageFilter.MedianFilter(size=3))
         
-        # Salva no estado da sessão
+        # --- PASSO 2: REALCE DE BORDAS ---
+        if contorno > 0:
+            # Encontra as bordas e as intensifica
+            bordas = img.filter(ImageFilter.FIND_EDGES).convert("L")
+            bordas = ImageEnhance.Contrast(bordas).enhance(contorno * 5)
+            # "Queima" as bordas pretas de volta na imagem original
+            img_bordas = Image.composite(Image.new("RGB", img.size, (0,0,0)), img, bordas)
+            img = ImageBlend = Image.blend(img, img_bordas, alpha=contorno/2)
+
+        # --- PASSO 3: AJUSTE DE CONTRASTE ---
+        img = ImageEnhance.Contrast(img).enhance(contraste_extra)
+        img = ImageEnhance.Sharpness(img).enhance(2.0)
+
+        # --- PASSO 4: REDUÇÃO (SUPER-SAMPLING) ---
+        # Reduz primeiro para 2x o tamanho com filtro de alta qualidade
+        temp_res = img.resize((GRID_W * 2, GRID_H * 2), Image.LANCZOS)
+        # Redução final para o tamanho LEGO usando NEAREST para não criar cores novas
+        img_final = temp_res.resize((GRID_W, GRID_H), Image.NEAREST)
+
+        # --- PASSO 5: QUANTIZAÇÃO K-MEANS ---
+        img_quant = img_final.quantize(colors=num_cores, method=2, kmeans=num_cores, dither=Image.NONE)
+        
         st.session_state.paleta = [img_quant.getpalette()[i*3:i*3+3] for i in range(num_cores)]
         st.session_state.matriz = np.array(img_quant)
         st.rerun()
 
-# --- ÁREA PRINCIPAL ---
+# --- INTERFACE PRINCIPAL (EDITOR E VISUALIZAÇÃO) ---
 if st.session_state.matriz is not None:
-    # Preparar a imagem para exibição
-    paleta = st.session_state.paleta
     matriz = st.session_state.matriz
+    paleta = st.session_state.paleta
     
-    p_flat = []
-    for c in paleta: p_flat.extend(c)
-    while len(p_flat) < 768: p_flat.append(0)
+    col_v, col_e = st.columns([2, 1])
     
-    img_display = Image.new("P", (GRID_W, GRID_H))
-    img_display.putpalette(p_flat)
-    img_display.putdata(matriz.flatten())
-    
-    col_view, col_edit = st.columns([2, 1])
-
-    with col_view:
-        st.subheader("🖼️ Visualização do Mosaico")
+    with col_v:
+        st.subheader("🖼️ Resultado com Filtros de Nitidez")
+        p_flat = []
+        for c in paleta: p_flat.extend(c)
+        while len(p_flat) < 768: p_flat.append(0)
+        
+        img_p = Image.new("P", (GRID_W, GRID_H))
+        img_p.putpalette(p_flat)
+        img_p.putdata(matriz.flatten())
+        
+        # Zoom para visualização
         escala = 8
-        view_rgb = img_display.convert("RGB").resize((GRID_W * escala, GRID_H * escala), Image.NEAREST)
+        v_rgb = img_p.convert("RGB").resize((GRID_W * escala, GRID_H * escala), Image.NEAREST)
+        draw = ImageDraw.Draw(v_rgb)
         
-        # Grade de placas (16x16)
-        draw_v = ImageDraw.Draw(view_rgb)
-        for x in range(0, GRID_W * escala, TAMANHO_PLACA * escala):
-            draw_v.line([(x, 0), (x, GRID_H * escala)], fill=(255, 0, 0, 120), width=1)
-        for y in range(0, GRID_H * escala, TAMANHO_PLACA * escala):
-            draw_v.line([(0, y), (GRID_H * escala, y)], fill=(255, 0, 0, 120), width=1)
+        # Grade de placas vermelha (sutil)
+        for x in range(0, GRID_W * escala, 16 * escala):
+            draw.line([(x, 0), (x, GRID_H * escala)], fill=(255, 0, 0, 80), width=1)
+        for y in range(0, GRID_H * escala, 16 * escala):
+            draw.line([(0, y), (GRID_H * escala, y)], fill=(255, 0, 0, 80), width=1)
             
-        st.image(view_rgb, use_container_width=True)
+        st.image(v_rgb, use_container_width=True)
 
-    with col_edit:
-        st.subheader("🖌️ Editor Manual")
-        st.write("Corrija pixels específicos:")
-        ex = st.number_input("X (Coluna)", 0, 79, 0)
-        ey = st.number_input("Y (Linha)", 0, 127, 0)
-        
-        cores_opcoes = [f"Cor {i+1} - RGB{paleta[i]}" for i in range(len(paleta))]
-        nova_cor = st.selectbox("Selecione a Cor", range(len(cores_opcoes)), format_func=lambda x: cores_opcoes[x])
-        
-        if st.button("Pintar Pixel"):
-            st.session_state.matriz[ey, ex] = nova_cor
-            st.success(f"Pixel ({ex},{ey}) atualizado!")
-            time.sleep(0.3)
+    with col_e:
+        st.subheader("🖌️ Ajuste de Pixel")
+        px = st.number_input("X (0-79)", 0, 79, 0)
+        py = st.number_input("Y (0-127)", 0, 127, 0)
+        c_sel = st.selectbox("Cor", range(len(paleta)), format_func=lambda x: f"Cor {x+1} {paleta[x]}")
+        if st.button("Aplicar"):
+            st.session_state.matriz[py, px] = c_sel
             st.rerun()
 
-    # --- GERAÇÃO DE PDF (ESTILO BRIKO - LINHA POR LINHA) ---
+    # --- PDF BRIKO-STYLE ---
     st.divider()
-    st.subheader("📄 Gerar Manual de Instruções")
-    
-    if st.button("🚀 Gerar PDF Passo-a-Passo"):
+    if st.button("🚀 Gerar PDF Linha-por-Linha"):
         try:
-            with st.spinner("Desenhando manual de 130 páginas..."):
+            with st.spinner("Desenhando manual..."):
                 pdf = FPDF(orientation="P", unit="mm", format="A4")
                 
-                # --- PÁGINA 1: OVERVIEW ---
+                # Capa
                 pdf.add_page()
                 pdf.set_font("Arial", 'B', 24)
-                pdf.cell(0, 20, "Project Overview", ln=True, align="C")
-                
-                # Capa (Imagem do projeto)
+                pdf.cell(0, 20, "Luffy Mosaic Build Guide", ln=True, align="C")
                 with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-                    view_rgb.save(tf.name)
+                    v_rgb.save(tf.name)
                     pdf.image(tf.name, x=35, y=40, w=140)
-                    path_capa = tf.name
+                    capa_path = tf.name
 
-                pdf.set_xy(10, 250)
-                pdf.set_font("Arial", '', 14)
-                pdf.cell(0, 10, f"Size: {GRID_W}x{GRID_H} studs | Total: {GRID_W*GRID_H} bricks", ln=True, align="C")
-
-                # --- PÁGINAS DE PASSOS (128 LINHAS) ---
-                cel = 10 # Tamanho do stud na imagem do PDF
-                img_progresso = Image.new("RGB", (GRID_W * cel, GRID_H * cel), (245, 245, 245))
-                draw_p = ImageDraw.Draw(img_progresso)
+                # Loop das 128 Linhas
+                cel = 10
+                img_step = Image.new("RGB", (GRID_W * cel, GRID_H * cel), (250, 250, 250))
+                draw_s = ImageDraw.Draw(img_step)
 
                 for step in range(GRID_H):
                     pdf.add_page()
                     pdf.set_font("Arial", 'B', 16)
-                    pdf.cell(0, 10, f"Step {step + 1}", ln=True)
+                    pdf.cell(0, 10, f"Step {step+1} / 128", ln=True)
                     
-                    # Informações da linha
-                    pdf.set_font("Arial", '', 11)
-                    pdf.cell(0, 6, f"Place now: {GRID_W}  |  Total so far: {(step+1)*GRID_W}", ln=True)
-                    
-                    # Legenda de cores desta linha
-                    linha_data = matriz[step, :]
-                    cores_na_linha = np.unique(linha_data)
+                    # Cores da linha
+                    linha = matriz[step, :]
+                    unique_c = np.unique(linha)
                     
                     pdf.set_font("Arial", 'B', 10)
-                    pdf.cell(0, 8, "Colors needed for this line:", ln=True)
+                    pdf.cell(0, 8, "Cores para esta linha:", ln=True)
                     
                     pdf.set_font("Arial", '', 9)
                     curr_x = 10
-                    for c_idx in cores_na_linha:
+                    for c_idx in unique_c:
                         rgb = paleta[c_idx]
-                        qtd = np.count_nonzero(linha_data == c_idx)
-                        
+                        qtd = np.count_nonzero(linha == c_idx)
                         pdf.set_fill_color(int(rgb[0]), int(rgb[1]), int(rgb[2]))
                         pdf.rect(curr_x, pdf.get_y(), 4, 4, 'F')
                         pdf.set_xy(curr_x + 5, pdf.get_y())
                         pdf.cell(35, 4, f"Cor {c_idx+1} ({qtd})")
                         curr_x += 40
-                        if curr_x > 180:
-                            curr_x = 10
-                            pdf.ln(5)
                     
-                    # Atualiza a imagem de progresso linha por linha
+                    # Atualiza desenho do passo
                     for col in range(GRID_W):
                         idx = matriz[step, col]
-                        rgb = tuple(paleta[idx])
-                        draw_p.rectangle([col*cel, step*cel, (col+1)*cel, (step+1)*cel], fill=rgb, outline=(180,180,180))
+                        draw_s.rectangle([col*cel, step*cel, (col+1)*cel, (step+1)*cel], fill=tuple(paleta[idx]), outline=(200,200,200))
 
-                    # Insere a imagem do progresso no PDF
                     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
-                        img_progresso.save(tf.name)
-                        pdf.image(tf.name, x=20, y=50, w=170)
-                        path_step = tf.name
-                    os.remove(path_step)
+                        img_step.save(tf.name)
+                        pdf.image(tf.name, x=33, y=50, w=144)
+                        step_path = tf.name
+                    os.remove(step_path)
 
-                    # Numeração de página
-                    pdf.set_xy(10, 285)
-                    pdf.set_font("Arial", 'I', 8)
-                    pdf.cell(0, 5, f"p. {step+1} of 128", align="R")
-
-                # --- PÁGINA FINAL: BOM ---
-                pdf.add_page()
-                pdf.set_font("Arial", 'B', 20)
-                pdf.cell(0, 15, "Bill of Materials", ln=True)
-                
-                counts = np.unique(matriz, return_counts=True)
-                for c_idx, count in zip(counts[0], counts[1]):
-                    rgb = paleta[c_idx]
-                    pdf.set_fill_color(int(rgb[0]), int(rgb[1]), int(rgb[2]))
-                    pdf.rect(10, pdf.get_y()+2, 6, 6, 'F')
-                    pdf.set_xy(20, pdf.get_y())
-                    pdf.set_font("Arial", '', 12)
-                    pdf.cell(100, 10, f"Cor {c_idx+1} (RGB: {rgb[0]},{rgb[1]},{rgb[2]})")
-                    pdf.cell(30, 10, f"Total: {count}", align="R")
-                    pdf.ln(8)
-
-                # Limpeza e Download
-                os.remove(path_capa)
-                pdf_output = pdf.output(dest='S').encode('latin-1')
-                st.success("✅ Manual Gerado!")
-                st.download_button("📥 Baixar PDF Briko-Style", pdf_output, "manual_montagem.pdf", "application/pdf")
-
+                os.remove(capa_path)
+                pdf_out = pdf.output(dest='S').encode('latin-1')
+                st.download_button("📥 Baixar PDF Briko", pdf_out, "manual_luffy.pdf", "application/pdf")
         except Exception as e:
-            st.error(f"Erro na geração: {e}")
-
-else:
-    st.info("Aguardando imagem...")
+            st.error(f"Erro: {e}")
